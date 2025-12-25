@@ -12,9 +12,8 @@ import time
 
 import jmcomic
 # 导入此模块，需要先安装（pip install jmcomic -i https://pypi.org/project -U）
-# 创建配置对象
-# 注册插件的装饰器
-@register("JMdownloader", "FateTrial", "一个下载JM本子的插件,修复了不能下载仅登录查看的本子请自行配置cookies", "1.0.1")
+
+@register("JMdownloader", "FateTrial", "一个下载JM本子的插件,修复了不能下载仅登录查看的本子请自行配置cookies", "1.0.6")
 class JMPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
@@ -35,7 +34,68 @@ class JMPlugin(Star):
         finally:
             self.downloading.discard(album_id)
 
-    # 注册指令的装饰器。指令名为 JM下载。注册成功后，发送 `/JM下载` 就会触发这个指令
+    # 获取详情的辅助函数（同步）
+    def get_album_detail(self, album_id, option):
+        # 使用 option.build_jm_client() 自动构建客户端
+        client = option.build_jm_client()
+        return client.get_album_detail(album_id)
+
+    # 格式化本子信息的辅助函数
+    def format_info(self, album):
+        # 处理标签，将列表转换为逗号分隔的字符串
+        tags_list = getattr(album, 'tags', [])
+        tags_str = ", ".join(tags_list) if tags_list else "无"
+        
+        # 获取页数
+        total_pages = getattr(album, 'page_count', 0)
+        if total_pages == 0 and hasattr(album, 'episode_list'):
+             total_pages = sum([len(ep) for ep in album])
+
+        # 美化排版
+        info_msg = (
+            f"📖 标题: {album.title}\n"
+            f"🆔 ID: {album.album_id}\n"
+            f"✍️ 作者: {album.author}\n"
+            f"📚 章节: {len(album)}\n"
+            f"📄 页数: {total_pages}\n"
+            f"🏷️ 关键词: {tags_str}"
+        )
+        return info_msg
+
+    # 指令：单独获取本子详情
+    @filter.command("jm")
+    async def jm_info(self, event: AstrMessageEvent):
+        path = os.path.abspath(os.path.dirname(__file__))
+        messages = event.get_messages()
+        if not messages:
+            yield event.plain_result("请输入本子ID")
+            return
+            
+        message_text = messages[0].text
+        parts = message_text.split()
+        if len(parts) < 2:
+            yield event.plain_result("请输入本子ID")
+            return
+            
+        jm_id = parts[1]
+        
+        yield event.plain_result(f"正在查询本子 {jm_id} 信息...")
+        
+        try:
+            # 创建配置
+            option = jmcomic.create_option_by_file(path + "/option.yml")
+            # 异步获取详情
+            album = await asyncio.to_thread(self.get_album_detail, jm_id, option)
+            
+            # 使用统一格式化函数
+            info_msg = self.format_info(album)
+            
+            yield event.plain_result(info_msg)
+            
+        except Exception as e:
+            yield event.plain_result(f"获取信息失败: {str(e)}\n请检查ID是否正确或Cookies是否过期。")
+
+    # 指令：下载本子
     @filter.command("jm下载")
     async def JMid(self, event: AstrMessageEvent):
         path = os.path.abspath(os.path.dirname(__file__))
@@ -61,33 +121,55 @@ class JMPlugin(Star):
             )
             return
             
-        # 创建配置并开始异步下载
-        yield event.plain_result(f"开始下载本子 {tokens}，请稍候...")
-        option = jmcomic.create_option_by_file(path + "/option.yml")
+        # 1. 初始化配置并获取本子信息
+        option = None
+        try:
+            option = jmcomic.create_option_by_file(path + "/option.yml")
+            
+            # 在下载前先获取详情
+            album = await asyncio.to_thread(self.get_album_detail, tokens, option)
+            
+            # 使用统一格式化函数 + 下载提示
+            info_msg = self.format_info(album)
+            final_msg = f"{info_msg}\n\n⬇️ 正在开始下载，请稍候..."
+            
+            yield event.plain_result(final_msg)
+            
+        except Exception as e:
+            yield event.plain_result(f"获取本子信息失败 ({str(e)})，尝试直接下载...")
         
+        # 2. 开始下载
+        if option is None:
+            try:
+                option = jmcomic.create_option_by_file(path + "/option.yml")
+            except Exception as e:
+                yield event.plain_result(f"配置加载失败: {str(e)}")
+                return
+
         success, error_msg = await self.download_comic_async(tokens, option)
         
         if not success:
             yield event.plain_result(error_msg)
             return
             
-        # 检查文件是否下载成功
+        # 3. 检查文件并发送
         if os.path.exists(pdf_path):
-            yield event.plain_result(f"本子 {tokens} 下载完成")
+            yield event.plain_result(f"✅ 本子 {tokens} 下载完成")
             yield event.chain_result(
                 [File(name=f"{tokens}.pdf", file=pdf_path)]
             )
         else:
-            yield event.plain_result(f"下载完成，但未找到生成的PDF文件，请检查下载路径")
+            yield event.plain_result(f"⚠️ 下载完成，但未找到生成的PDF文件，请检查下载路径")
 
     @filter.command("jm_help")
     async def show_help(self, event: AstrMessageEvent):
         '''显示帮助信息'''
         help_text = """JM下载插件指令说明：
         
-/jm下载 本子ID - 下载JM漫画 如果有多页，请输入第一页的ID
+/jm [ID] - 获取本子详细信息
+/jm下载 [ID] - 下载JM漫画 (如果有多页，请输入第一页的ID)
 /jm_help - 显示本帮助信息
 
-powerd by FateTrial
+Powered by FateTrial
 """
         yield event.plain_result(help_text)
